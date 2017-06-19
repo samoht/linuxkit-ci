@@ -25,14 +25,23 @@ let vms =
   in
   Gcp.make ~state:"/ci-state/gcloud-vms" ~prefix
 
-(* Our local Git clone of the LinuxKit source repository. *)
-let src_repo =
+let repo project =
+  (* Our local Git clone of the source repository. *)
   let remote =
     match profile with
-    | `Production -> "https://github.com/linuxkit/linuxkit.git"
-    | `Localhost -> "/fake-remote/linuxkit"       (* Pull from our local "remote" *)
+    | `Production -> Fmt.strf "https://github.com/linuxkit/%s.git" project
+    | `Localhost  -> "/fake-remote/" ^ project  (* local "remote" *)
   in
-  Git.v ~logs ~remote "/repos/linuxkit"
+  Git.v ~logs ~remote ("/repos/" ^ project)
+
+(* Our local Git clone of the LinuxKit source repository. *)
+let src_repo = repo "linuxkit"
+
+(* The repository and branch where the whitelist is stored *)
+let whitelist_repo = repo "linuxkit-ci"
+let whitelist_ref =
+  `Ref (Datakit_github.(Repo.v ~user:(User.v "linuxkit") ~repo:"linuxkit-ci"),
+        ["master"])
 
 let ci_repo =
   let remote =
@@ -61,12 +70,30 @@ module Builder = struct
   let check_builds term =
     term >|= fun (_:Docker.Image.t) -> "Build succeeded"
 
+  let whitelist = Whitelist.make ~logs
+  let pr_state = PR_state.make ~logs
   let builder = Linuxkit_build.make ~logs ~pool ~google_pool ~vms ~build_cache
   let tester = Linuxkit_test.make ~logs ~google_pool ~vms ~build_cache
 
-  (* To build, "git fetch" the head of the branch, tag or PR being tested, then use [builder]. *)
-  let build repo ~builder ~target =
-    Git.fetch_head repo target >>=
+  (* read the whitelist *)
+  let read_whitelist =
+    Git.fetch_head whitelist_repo whitelist_ref >>=
+    Whitelist.v whitelist
+
+  (* check if the target can be tested *)
+  let should_be_tested ~target whitelist =
+    Term.target target >>= function
+    | `Ref _ -> Term.return true
+    | `PR pr ->
+      PR_state.v pr_state whitelist pr >|= function
+      | `OkToTest
+      | `InWhiteList   -> true
+      | `NotAuthorized -> false
+
+  (* To build, "git fetch" the head of the branch, tag or PR being
+     tested, then use [builder]. *)
+  let build ~target =
+    Git.fetch_head src_repo target >>=
     Linuxkit_build.build builder ~target
 
   (* How to test the various images we produce. *)
@@ -77,13 +104,19 @@ module Builder = struct
       | None -> Term.fail "Output %s not found" x
     in
     Term.wait_for_all [
-      "GCP", get "test.img.tar.gz" >>= Linuxkit_test.gcp tester;
+      "GCP", get "test.img.tar.gz" >>=
+      Linuxkit_test.gcp tester
     ]
     >|= fun () -> "All tests passed"
 
-  (* The "linuxkit-ci" status for a target is the result of building it and then testing the images. *)
+  (* The "linuxkit-ci" status for a target is the result of building
+     it and then testing the images. *)
   let status target = [
-    "linuxkit-ci", build src_repo ~builder ~target >>= test_images
+    "linuxkit-ci",
+    read_whitelist >>=
+    should_be_tested ~target >>= function
+    | false -> Term.return "Not authorized"
+    | true  -> build ~target >>= test_images
   ]
 
   (* Test that LinuxKitCI itself builds. *)
