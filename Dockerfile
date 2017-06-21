@@ -1,10 +1,19 @@
 #FROM datakit/ci:latest AS build-env
 FROM datakit/ci@sha256:daecb5fa1e017c39323d39bebfc0e6f94762452f46c29aafe115e7270166d692 AS build-env
 
+RUN git -C /home/opam/opam-repository fetch origin && \
+    git -C /home/opam/opam-repository reset 48cd3001d --hard && \
+    opam update -u
+
+RUN opam pin add -n datakit-github.dev --dev
+RUN opam pin add -n datakit-ci.dev --dev
+RUN opam upgrade datakit-ci datakit-github
+
 ARG CONFIG=dkciCI
 ADD . /src
 WORKDIR /src
 RUN sudo chown -R opam /src
+
 RUN opam config exec make
 
 FROM alpine:3.5
